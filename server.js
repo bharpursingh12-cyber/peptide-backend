@@ -1,58 +1,48 @@
 /**
- * PeptideProspect AI - SQLite Backend
- * Complete REST API with better-sqlite3 for Render.com deployment
- * @version 2.1.0
+ * PeptideProspect AI — Backend API v2.1 (SQLite)
+ * REST API for opportunities, AI responses, queue, analytics
+ * Port: from env PORT or 8009
  */
 
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const OpenAI = require('openai');
-const path = require('path');
-const fs = require('fs');
-
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 10000;
-const DB_PATH = process.env.DB_PATH || '/tmp/peptide.db';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const VERSION = '2.1.0';
+const sqlite3 = require('sqlite3');
+const { open } = require('sqlite');
 
 const app = express();
-const startTime = Date.now();
 
-// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'] }));
-app.use(express.json({ limit: '10mb' }));
+// ─── CONFIG ───────────────────────────────────────────
+const PORT = process.env.PORT || 8009;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const DB_PATH = process.env.DB_PATH || '/tmp/peptide.db';
 
-// Request logging middleware
+// CORS
+app.use(cors({ origin: '*', methods: ['GET','POST','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.use(express.json({ limit: '50mb' }));
+
+// Request logging
 app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.path} - ${req.ip || 'unknown'}`);
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
   next();
 });
 
-// ─── OPENAI CLIENT ────────────────────────────────────────────────────────────
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
-
-// ─── DATABASE SETUP ───────────────────────────────────────────────────────────
+// ─── SQLITE ───────────────────────────────────────────
 let db;
-
-function getDb() {
+async function getDb() {
   if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
+    db = await open({ filename: DB_PATH, driver: sqlite3.Database });
+    await db.exec('PRAGMA journal_mode = WAL');
   }
   return db;
 }
 
-function initDb() {
-  const database = getDb();
+// ─── INIT ─────────────────────────────────────────────
+async function initDb() {
+  const d = await getDb();
 
-  // ── opportunities table ──────────────────────────────────────────────────
-  database.exec(`
+  await d.exec(`
     CREATE TABLE IF NOT EXISTS opportunities (
       id TEXT PRIMARY KEY,
       platform TEXT NOT NULL,
@@ -71,10 +61,11 @@ function initDb() {
       keywords_matched TEXT,
       raw_data TEXT
     );
-  `);
+    CREATE INDEX IF NOT EXISTS idx_opp_platform ON opportunities(platform);
+    CREATE INDEX IF NOT EXISTS idx_opp_status ON opportunities(status);
+    CREATE INDEX IF NOT EXISTS idx_opp_score ON opportunities(intent_score);
+    CREATE INDEX IF NOT EXISTS idx_opp_discovered ON opportunities(discovered_at);
 
-  // ── engagement_queue table ───────────────────────────────────────────────
-  database.exec(`
     CREATE TABLE IF NOT EXISTS engagement_queue (
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
       opportunity_id TEXT REFERENCES opportunities(id),
@@ -89,10 +80,9 @@ function initDb() {
       executed_at TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
-  `);
+    CREATE INDEX IF NOT EXISTS idx_queue_status ON engagement_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_queue_opp ON engagement_queue(opportunity_id);
 
-  // ── brand_settings table ─────────────────────────────────────────────────
-  database.exec(`
     CREATE TABLE IF NOT EXISTS brand_settings (
       id INTEGER PRIMARY KEY DEFAULT 1,
       brand_name TEXT DEFAULT 'My Brand',
@@ -102,10 +92,7 @@ function initDb() {
       platforms_enabled TEXT DEFAULT '["reddit","tiktok","instagram","twitter","youtube"]',
       auto_engage_threshold INTEGER DEFAULT 85
     );
-  `);
 
-  // ── analytics_daily table ────────────────────────────────────────────────
-  database.exec(`
     CREATE TABLE IF NOT EXISTS analytics_daily (
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
       date TEXT NOT NULL,
@@ -116,10 +103,7 @@ function initDb() {
       responses_sent INTEGER DEFAULT 0,
       avg_intent_score REAL DEFAULT 0
     );
-  `);
 
-  // ── activities table ─────────────────────────────────────────────────────
-  database.exec(`
     CREATE TABLE IF NOT EXISTS activities (
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
       entity_type TEXT,
@@ -130,1103 +114,405 @@ function initDb() {
     );
   `);
 
-  // ── Create indexes for performance ───────────────────────────────────────
-  database.exec(`
-    CREATE INDEX IF NOT EXISTS idx_opportunities_platform ON opportunities(platform);
-    CREATE INDEX IF NOT EXISTS idx_opportunities_status ON opportunities(status);
-    CREATE INDEX IF NOT EXISTS idx_opportunities_intent_score ON opportunities(intent_score);
-    CREATE INDEX IF NOT EXISTS idx_opportunities_discovered ON opportunities(discovered_at);
-    CREATE INDEX IF NOT EXISTS idx_opportunities_username ON opportunities(username);
-    CREATE INDEX IF NOT EXISTS idx_queue_status ON engagement_queue(status);
-    CREATE INDEX IF NOT EXISTS idx_queue_opportunity ON engagement_queue(opportunity_id);
-    CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_daily(date);
-    CREATE INDEX IF NOT EXISTS idx_activities_created ON activities(created_at);
-  `);
-
-  console.log('[DB] Schema initialized successfully');
+  // Seed settings
+  const settings = await d.get('SELECT COUNT(*) as c FROM brand_settings');
+  if (settings.c === 0) {
+    await d.run(`INSERT INTO brand_settings (brand_name, tone, product_description) VALUES ('My Brand', 'professional', 'research peptides')`);
+  }
+  console.log('[DB] Tables and indexes created');
 }
 
-// ─── SEED DATA ────────────────────────────────────────────────────────────────
-function seedData() {
-  const database = getDb();
+// ─── SEED DATA ────────────────────────────────────────
+async function seedData() {
+  const d = await getDb();
+  const count = await d.get('SELECT COUNT(*) as c FROM opportunities');
+  if (count.c > 0) return;
 
-  // Check if data already exists
-  const count = database.prepare('SELECT COUNT(*) as c FROM opportunities').get();
-  if (count.c > 0) {
-    console.log('[DB] Data already exists, skipping seed');
-    return;
+  console.log('[DB] Seeding opportunities...');
+  const ops = [
+    { id:'reddit_r1', p:'reddit', u:'peptide_researcher22', c:'Looking for a reliable source for BPC-157. Anyone have recommendations? Been dealing with a nagging shoulder injury and heard this could help with recovery.', t:'purchase_intent', s:92, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/abc123' },
+    { id:'reddit_r2', p:'reddit', u:'gymrat2024', c:'What is the best peptide for muscle growth? Looking to stack with my current routine. Been hearing good things about CJC-1295 and Ipamorelin.', t:'research_query', s:87, sub:'PEDs', url:'https://reddit.com/r/PEDs/comments/def456' },
+    { id:'reddit_r3', p:'reddit', u:'biohacker99', c:'Just finished my first month of TB-500. Results have been incredible for my tendonitis. Happy to answer any questions for those considering it.', t:'review_request', s:78, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/ghi789' },
+    { id:'reddit_r4', p:'reddit', u:'injured_runner', c:'Where to buy BPC-157 and TB-500 that ships to Canada? Need it ASAP for my marathon training. Any legit sources?', t:'purchase_intent', s:95, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/mno345' },
+    { id:'reddit_r5', p:'reddit', u:'longevity_dave', c:'Comparing different GHRH peptides - CJC-1295 vs Sermorelin vs Tesamorelin. Which gives the best GH pulse profile for anti-aging purposes?', t:'comparison', s:81, sub:'longevity', url:'https://reddit.com/r/longevity/comments/jkl012' },
+    { id:'reddit_r6', p:'reddit', u:'gym_bro_88', c:'Anyone tried ipamorelin + CJC-1295 no DAC? What was your experience? Looking to start a 12-week cycle.', t:'research_query', s:73, sub:'PEDs', url:'https://reddit.com/r/PEDs/comments/pqr678' },
+    { id:'reddit_r7', p:'reddit', u:'recovery_quest', c:'What is the best source for research peptides in 2024? Need BPC-157, TB-500, and ipamorelin. Preferably with third-party testing.', t:'purchase_intent', s:90, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/stu901' },
+    { id:'reddit_r8', p:'reddit', u:'fitness_guru22', c:'Stacking MK-677 with CJC-1295 and Ipamorelin. Thoughts on dosages and timing? First time trying this combo.', t:'research_query', s:68, sub:'SARMs', url:'https://reddit.com/r/SARMs/comments/vwx234' },
+    { id:'reddit_r9', p:'reddit', u:'shoulder_pain_guy', c:'BPC-157 for rotator cuff injury - how long before you noticed results? Using 250mcg twice daily subQ near the injury site.', t:'review_request', s:76, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/yza567' },
+    { id:'reddit_r10', p:'reddit', u:'lean_gainz', c:'Best peptide for lean muscle gain while cutting? Looking at GHRP-6, Ipamorelin, or CJC-1295. Any recommendations based on personal experience?', t:'research_query', s:83, sub:'bodybuilding', url:'https://reddit.com/r/bodybuilding/comments/bcd890' },
+    { id:'reddit_r11', p:'reddit', u:'antiaging_mary', c:'Looking for a legit peptide source that ships to Europe. Want to try BPC-157 for joint pain and CJC-1295 for anti-aging. Any recommendations?', t:'purchase_intent', s:88, sub:'longevity', url:'https://reddit.com/r/longevity/comments/efg123' },
+    { id:'reddit_r12', p:'reddit', u:'science_lifter', c:'The science behind BPC-157 and TB-500 synergy for injury recovery. Found this study and wanted to share my protocol and results after 8 weeks.', t:'review_request', s:72, sub:'Peptides', url:'https://reddit.com/r/Peptides/comments/ijk456' },
+    { id:'tiktok_t1', p:'tiktok', u:'@fitnesswithsarah', c:'POV: you finally found a peptide source that actually ships fast and has lab results #peptides #fitness', t:'purchase_intent', s:85, sub:null, url:'https://tiktok.com/@fitnesswithsarah/video/123' },
+    { id:'tiktok_t2', p:'tiktok', u:'@biohackertom', c:'Day 30 of BPC-157 protocol - the results are INSANE #peptide #recovery #fitnessjourney', t:'review_request', s:79, sub:null, url:'https://tiktok.com/@biohackertom/video/456' },
+    { id:'tiktok_t3', p:'tiktok', u:'@research_chem_girl', c:'Where do you guys get your research peptides from? Looking for a reliable source with COAs #peptides #research', t:'purchase_intent', s:82, sub:null, url:'https://tiktok.com/@research_chem_girl/video/789' },
+    { id:'instagram_i1', p:'instagram', u:'@ironandbiology', c:'New video up: Everything you need to know about BPC-157 vs TB-500 for injury recovery. Link in bio! Which one are you using?', t:'research_query', s:72, sub:null, url:'https://instagram.com/p/ABC123' },
+    { id:'instagram_i2', p:'instagram', u:'@peptide.education', c:'DM me if you want my trusted source list for research peptides. I only vouch for companies with third-party testing. #peptides #transparency', t:'purchase_intent', s:91, sub:null, url:'https://instagram.com/p/DEF456' },
+    { id:'twitter_tw1', p:'twitter', u:'@peptideguru', c:'Just tried a new peptide supplier and the quality is night and day compared to my old source. DM for details. #peptides #qualitymatters', t:'purchase_intent', s:86, sub:null, url:'https://twitter.com/peptideguru/status/123' },
+    { id:'twitter_tw2', p:'twitter', u:'@sciencebro87', c:'Looking for peer-reviewed studies on CJC-1295 + Ipamorelin stack efficacy. Building a protocol and want evidence-based dosing. Any links appreciated!', t:'research_query', s:74, sub:null, url:'https://twitter.com/sciencebro87/status/456' },
+    { id:'youtube_y1', p:'youtube', u:'MorePlatesMoreDates', c:'In this video we discuss the BEST peptide sources in 2024, how to identify fake COAs, and what to look for in a quality supplier.', t:'purchase_intent', s:89, sub:null, url:'https://youtube.com/watch?v=xyz789' },
+  ];
+
+  for (const o of ops) {
+    await d.run(`INSERT OR IGNORE INTO opportunities (id, platform, username, content, intent_type, intent_score, subreddit, post_url, engaged, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'new')`,
+      [o.id, o.p, o.u, o.c, o.t, o.s, o.sub, o.url]);
   }
 
-  console.log('[DB] Seeding database...');
+  // Seed analytics
+  for (let i = 0; i < 7; i++) {
+    const date = new Date();
+    date.setDate(date.getDate() - i);
+    await d.run(`INSERT OR IGNORE INTO analytics_daily (date, platform, opportunities_found, avg_intent_score)
+      VALUES (?, 'reddit', ?, ?)`,
+      [date.toISOString().split('T')[0], Math.floor(Math.random() * 8) + 2, 70 + Math.random() * 15]);
+  }
 
-  // ── Seed Opportunities (20 realistic peptide opportunities) ──────────────
-  const opportunities = [
-    {
-      id: 'opp_reddit_001',
-      platform: 'reddit', username: 'BioHackerMike', content: 'Just started my BPC-157 cycle for gut healing. Day 3 and already noticing reduced inflammation. Has anyone stacked this with TB-500 for enhanced recovery? Looking for the best source for research-grade peptides.',
-      intent_type: 'purchase_intent', intent_score: 92, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/abc123', media_url: '', engaged: 0,
-      discovered_at: '2025-06-01T08:23:00Z', status: 'new',
-      keywords_matched: '["BPC-157","TB-500","peptide","research"]',
-      raw_data: '{"upvotes": 45, "comments": 12}'
-    },
-    {
-      id: 'opp_reddit_002',
-      platform: 'reddit', username: 'GymRat2024', content: 'Where can I buy legit CJC-1295 + Ipamorelin blend? Tired of sketchy vendors. Need lab-tested stuff for my research.',
-      intent_type: 'purchase_intent', intent_score: 95, subreddit: 'PEDs',
-      post_url: 'https://reddit.com/r/PEDs/comments/def456', media_url: '', engaged: 0,
-      discovered_at: '2025-06-01T10:15:00Z', status: 'new',
-      keywords_matched: '["CJC-1295","Ipamorelin","peptide","buy"]',
-      raw_data: '{"upvotes": 78, "comments": 23}'
-    },
-    {
-      id: 'opp_reddit_003',
-      platform: 'reddit', username: 'LongevityLucy', content: 'Researching peptides for anti-aging. Currently looking at Epitalon and FOXO4-DRI. Any recommendations on reputable sources? Price isn\'t an issue, quality is.',
-      intent_type: 'research_query', intent_score: 88, subreddit: 'longevity',
-      post_url: 'https://reddit.com/r/longevity/comments/ghi789', media_url: '', engaged: 0,
-      discovered_at: '2025-06-02T14:30:00Z', status: 'new',
-      keywords_matched: '["peptide","Epitalon","research","anti-aging"]',
-      raw_data: '{"upvotes": 32, "comments": 8}'
-    },
-    {
-      id: 'opp_reddit_004',
-      platform: 'reddit', username: 'PeptideNewbie', content: 'Complete beginner here. What\'s the difference between MOD-GRF and CJC-1295 with DAC? Which is better for research purposes?',
-      intent_type: 'research_query', intent_score: 72, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/jkl012', media_url: '', engaged: 0,
-      discovered_at: '2025-06-02T16:45:00Z', status: 'new',
-      keywords_matched: '["CJC-1295","peptide","research","MOD-GRF"]',
-      raw_data: '{"upvotes": 15, "comments": 19}'
-    },
-    {
-      id: 'opp_reddit_005',
-      platform: 'reddit', username: 'IronChad92', content: 'Review request: Just received TB-500 from [vendor]. Vial looks clear, no particles. Planning to start research tomorrow. Will update with results.',
-      intent_type: 'review_request', intent_score: 65, subreddit: 'bodybuilding',
-      post_url: 'https://reddit.com/r/bodybuilding/comments/mno345', media_url: '', engaged: 0,
-      discovered_at: '2025-06-03T09:10:00Z', status: 'new',
-      keywords_matched: '["TB-500","peptide","review"]',
-      raw_data: '{"upvotes": 22, "comments": 7}'
-    },
-    {
-      id: 'opp_reddit_006',
-      platform: 'reddit', username: 'ResearchDoc', content: 'Clinical comparison: BPC-157 vs TB-500 for tendon repair in rodent models. BPC showed faster initial healing, TB showed better long-term collagen organization. Full study in comments.',
-      intent_type: 'comparison', intent_score: 85, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/pqr678', media_url: '', engaged: 0,
-      discovered_at: '2025-06-03T11:20:00Z', status: 'new',
-      keywords_matched: '["BPC-157","TB-500","peptide","comparison"]',
-      raw_data: '{"upvotes": 156, "comments": 34}'
-    },
-    {
-      id: 'opp_reddit_007',
-      platform: 'reddit', username: 'SARMsExplorer', content: 'Looking to compare peptide sources. Currently using X-Peptides but thinking about switching. Who has the best third-party testing?',
-      intent_type: 'comparison', intent_score: 90, subreddit: 'SARMs',
-      post_url: 'https://reddit.com/r/SARMs/comments/stu901', media_url: '', engaged: 0,
-      discovered_at: '2025-06-04T07:55:00Z', status: 'new',
-      keywords_matched: '["peptide","SARMs","third-party testing","compare"]',
-      raw_data: '{"upvotes": 41, "comments": 15}'
-    },
-    {
-      id: 'opp_reddit_008',
-      platform: 'reddit', username: 'FitMomSarah', content: 'Need help finding a trustworthy peptide vendor for BPC-157. Using it for post-surgery recovery research. So many scam sites out there!',
-      intent_type: 'purchase_intent', intent_score: 93, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/vwx234', media_url: '', engaged: 0,
-      discovered_at: '2025-06-04T13:40:00Z', status: 'new',
-      keywords_matched: '["BPC-157","peptide","vendor","trustworthy"]',
-      raw_data: '{"upvotes": 67, "comments": 28}'
-    },
-    {
-      id: 'opp_reddit_009',
-      platform: 'reddit', username: 'RecoveryRoad', content: 'Week 4 of TB-500 + BPC-157 stack for shoulder injury. Pain down 60%, ROM improved significantly. Will continue for 2 more weeks.',
-      intent_type: 'review_request', intent_score: 78, subreddit: 'bodybuilding',
-      post_url: 'https://reddit.com/r/bodybuilding/comments/yza567', media_url: '', engaged: 0,
-      discovered_at: '2025-06-05T06:15:00Z', status: 'new',
-      keywords_matched: '["TB-500","BPC-157","peptide","stack"]',
-      raw_data: '{"upvotes": 89, "comments": 21}'
-    },
-    {
-      id: 'opp_reddit_010',
-      platform: 'reddit', username: 'PeptideScientist', content: 'Seeking high-purity Ipamorelin for ongoing research project. Need COA and HPLC data. Budget is $500/month. DM with verified sources only.',
-      intent_type: 'purchase_intent', intent_score: 96, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/bcd890', media_url: '', engaged: 0,
-      discovered_at: '2025-06-05T18:25:00Z', status: 'new',
-      keywords_matched: '["Ipamorelin","peptide","COA","research"]',
-      raw_data: '{"upvotes": 34, "comments": 11}'
-    },
-    {
-      id: 'opp_reddit_011',
-      platform: 'reddit', username: 'TendonTrouble', content: 'Chronic Achilles tendinopathy - has anyone had success with BPC-157 injections? Looking for protocol and dosage for research purposes.',
-      intent_type: 'research_query', intent_score: 82, subreddit: 'Peptides',
-      post_url: 'https://reddit.com/r/Peptides/comments/efg123', media_url: '', engaged: 0,
-      discovered_at: '2025-06-06T08:50:00Z', status: 'new',
-      keywords_matched: '["BPC-157","peptide","protocol","research"]',
-      raw_data: '{"upvotes": 52, "comments": 17}'
-    },
-    {
-      id: 'opp_reddit_012',
-      platform: 'reddit', username: 'AntiAgingAndy', content: 'Comparison of major peptide vendors 2025 edition. Testing purity, shipping speed, customer service. Currently ranking Top 5.',
-      intent_type: 'comparison', intent_score: 75, subreddit: 'longevity',
-      post_url: 'https://reddit.com/r/longevity/comments/hij456', media_url: '', engaged: 0,
-      discovered_at: '2025-06-06T15:35:00Z', status: 'new',
-      keywords_matched: '["peptide","vendor","comparison","purity"]',
-      raw_data: '{"upvotes": 203, "comments": 56}'
-    },
-    {
-      id: 'opp_tiktok_001',
-      platform: 'tiktok', username: '@peptideguru', content: 'Day 12 of my BPC-157 protocol and the results are INSANE. Comment below if you want my source list! #peptides #bpc157 #biohacking',
-      intent_type: 'purchase_intent', intent_score: 87, subreddit: '',
-      post_url: 'https://tiktok.com/@peptideguru/video/abc123', media_url: 'https://tiktok.com/video/abc123.mp4', engaged: 0,
-      discovered_at: '2025-06-02T12:00:00Z', status: 'new',
-      keywords_matched: '["BPC-157","peptide","biohacking"]',
-      raw_data: '{"views": 45000, "likes": 3200, "shares": 180}'
-    },
-    {
-      id: 'opp_tiktok_002',
-      platform: 'tiktok', username: '@gymtokscientist', content: 'POV: You just found out about CJC-1295 Ipamorelin stack and your whole world changed. Link in bio for my research guide! #gymmotivation #peptides',
-      intent_type: 'purchase_intent', intent_score: 91, subreddit: '',
-      post_url: 'https://tiktok.com/@gymtokscientist/video/def456', media_url: 'https://tiktok.com/video/def456.mp4', engaged: 0,
-      discovered_at: '2025-06-04T09:30:00Z', status: 'new',
-      keywords_matched: '["CJC-1295","Ipamorelin","peptide","stack"]',
-      raw_data: '{"views": 89000, "likes": 5400, "shares": 320}'
-    },
-    {
-      id: 'opp_tiktok_003',
-      platform: 'tiktok', username: '@biohackbeth', content: 'Testing 3 different peptide brands so you don\'t have to! Which one has the best purity? Results dropping tomorrow! #peptidereview #research',
-      intent_type: 'comparison', intent_score: 80, subreddit: '',
-      post_url: 'https://tiktok.com/@biohackbeth/video/ghi789', media_url: 'https://tiktok.com/video/ghi789.mp4', engaged: 0,
-      discovered_at: '2025-06-06T11:15:00Z', status: 'new',
-      keywords_matched: '["peptide","review","purity","research"]',
-      raw_data: '{"views": 67000, "likes": 4100, "shares": 250}'
-    },
-    {
-      id: 'opp_instagram_001',
-      platform: 'instagram', username: '@fitness_dr_james', content: 'New blog post: Complete guide to research peptides for recovery. TB-500 and BPC-157 protocols explained. DM me for my trusted source list! #peptides #recovery',
-      intent_type: 'purchase_intent', intent_score: 89, subreddit: '',
-      post_url: 'https://instagram.com/p/abc123', media_url: 'https://instagram.com/p/abc123.jpg', engaged: 0,
-      discovered_at: '2025-06-03T14:20:00Z', status: 'new',
-      keywords_matched: '["TB-500","BPC-157","peptide","recovery"]',
-      raw_data: '{"likes": 1200, "comments": 45, "saves": 89}'
-    },
-    {
-      id: 'opp_instagram_002',
-      platform: 'instagram', username: '@wellnesswithlisa', content: 'Looking for a peptide vendor with lab testing and fast shipping. Has anyone ordered from a good source recently? Please share! #peptidesearch',
-      intent_type: 'purchase_intent', intent_score: 94, subreddit: '',
-      post_url: 'https://instagram.com/p/def456', media_url: 'https://instagram.com/p/def456.jpg', engaged: 0,
-      discovered_at: '2025-06-05T16:45:00Z', status: 'new',
-      keywords_matched: '["peptide","vendor","lab testing","shipping"]',
-      raw_data: '{"likes": 856, "comments": 67, "saves": 34}'
-    },
-    {
-      id: 'opp_twitter_001',
-      platform: 'twitter', username: '@BiohackerTech', content: 'Just ordered research-grade BPC-157 and TB-500. The peptide market is wild right now. Make sure you\'re buying from vendors with third-party COAs! Thread below on what to look for.',
-      intent_type: 'purchase_intent', intent_score: 86, subreddit: '',
-      post_url: 'https://twitter.com/BiohackerTech/status/abc123', media_url: '', engaged: 0,
-      discovered_at: '2025-06-03T20:10:00Z', status: 'new',
-      keywords_matched: '["BPC-157","TB-500","peptide","COA"]',
-      raw_data: '{"likes": 234, "retweets": 45, "replies": 23}'
-    },
-    {
-      id: 'opp_twitter_002',
-      platform: 'twitter', username: '@DrPeptideMD', content: 'Question for the peptide community: What\'s your experience with Ipamorelin + CJC-1295 no DAC? Seeing promising results in my practice for sleep and recovery optimization.',
-      intent_type: 'research_query', intent_score: 83, subreddit: '',
-      post_url: 'https://twitter.com/DrPeptideMD/status/def456', media_url: '', engaged: 0,
-      discovered_at: '2025-06-05T22:30:00Z', status: 'new',
-      keywords_matched: '["Ipamorelin","CJC-1295","peptide","sleep","recovery"]',
-      raw_data: '{"likes": 567, "retweets": 89, "replies": 56}'
-    },
-    {
-      id: 'opp_youtube_001',
-      platform: 'youtube', username: 'PeptideScienceChannel', content: 'Video: "My Top 5 Peptide Sources for 2025 - Lab Tested & Verified" - I tested peptides from 12 different vendors and these are the results. Links in description for discount codes.',
-      intent_type: 'comparison', intent_score: 79, subreddit: '',
-      post_url: 'https://youtube.com/watch?v=abc123', media_url: 'https://youtube.com/thumb/abc123.jpg', engaged: 0,
-      discovered_at: '2025-06-06T10:00:00Z', status: 'new',
-      keywords_matched: '["peptide","sources","lab tested","verified"]',
-      raw_data: '{"views": 125000, "likes": 4500, "comments": 230}'
-    },
-  ];
-
-  const insertOpp = database.prepare(`
-    INSERT INTO opportunities (id, platform, username, content, intent_type, intent_score, subreddit, post_url, media_url, engaged, discovered_at, updated_at, ai_responses, status, keywords_matched, raw_data)
-    VALUES (@id, @platform, @username, @content, @intent_type, @intent_score, @subreddit, @post_url, @media_url, @engaged, @discovered_at, datetime('now'), @ai_responses, @status, @keywords_matched, @raw_data)
-  `);
-
-  const insertMany = database.transaction((rows) => {
-    for (const row of rows) {
-      insertOpp.run(row);
-    }
-  });
-
-  insertMany(opportunities);
-  console.log(`[DB] Inserted ${opportunities.length} opportunities`);
-
-  // ── Seed brand_settings ──────────────────────────────────────────────────
-  const insertSettings = database.prepare(`
-    INSERT OR IGNORE INTO brand_settings (id, brand_name, tone, product_description, keywords, platforms_enabled, auto_engage_threshold)
-    VALUES (1, 'PeptideProspect AI', 'professional', 'research peptides',
-            '["peptide","BPC-157","TB-500","CJC-1295","Ipamorelin","SARMs","research","biohacking"]',
-            '["reddit","tiktok","instagram","twitter","youtube"]', 85)
-  `);
-  insertSettings.run();
-  console.log('[DB] Inserted brand settings');
-
-  // ── Seed analytics_daily (last 5 days) ───────────────────────────────────
-  const analyticsData = [
-    { date: '2025-06-06', platform: 'reddit', opportunities_found: 8, responses_generated: 6, responses_approved: 4, responses_sent: 3, avg_intent_score: 87.5 },
-    { date: '2025-06-05', platform: 'all', opportunities_found: 12, responses_generated: 9, responses_approved: 6, responses_sent: 5, avg_intent_score: 84.2 },
-    { date: '2025-06-04', platform: 'all', opportunities_found: 15, responses_generated: 11, responses_approved: 8, responses_sent: 7, avg_intent_score: 81.0 },
-    { date: '2025-06-03', platform: 'all', opportunities_found: 10, responses_generated: 7, responses_approved: 5, responses_sent: 4, avg_intent_score: 88.3 },
-    { date: '2025-06-02', platform: 'all', opportunities_found: 18, responses_generated: 14, responses_approved: 10, responses_sent: 8, avg_intent_score: 85.7 },
-  ];
-
-  const insertAnalytics = database.prepare(`
-    INSERT INTO analytics_daily (id, date, platform, opportunities_found, responses_generated, responses_approved, responses_sent, avg_intent_score)
-    VALUES (lower(hex(randomblob(16))), @date, @platform, @opportunities_found, @responses_generated, @responses_approved, @responses_sent, @avg_intent_score)
-  `);
-
-  const insertAnalyticsMany = database.transaction((rows) => {
-    for (const row of rows) {
-      insertAnalytics.run(row);
-    }
-  });
-
-  insertAnalyticsMany(analyticsData);
-  console.log(`[DB] Inserted ${analyticsData.length} analytics rows`);
-
-  // ── Seed activities ──────────────────────────────────────────────────────
-  const activities = [
-    { entity_type: 'opportunity', entity_id: 'opp_reddit_001', activity_type: 'discovered', description: 'Discovered Reddit post by BioHackerMike about BPC-157 and TB-500 stack' },
-    { entity_type: 'opportunity', entity_id: 'opp_reddit_002', activity_type: 'discovered', description: 'Discovered high-intent purchase query from GymRat2024 seeking CJC-1295 blend' },
-    { entity_type: 'system', entity_id: 'seed', activity_type: 'database_initialized', description: 'Database seeded with 20 opportunities, brand settings, and analytics' },
-  ];
-
-  const insertActivity = database.prepare(`
-    INSERT INTO activities (id, entity_type, entity_id, activity_type, description, created_at)
-    VALUES (lower(hex(randomblob(16))), @entity_type, @entity_id, @activity_type, @description, datetime('now'))
-  `);
-
-  const insertActivitiesMany = database.transaction((rows) => {
-    for (const row of rows) {
-      insertActivity.run(row);
-    }
-  });
-
-  insertActivitiesMany(activities);
-  console.log(`[DB] Inserted ${activities.length} activities`);
-
-  console.log('[DB] Seed complete!');
+  console.log(`[DB] Seeded ${ops.length} opportunities`);
 }
 
-// ─── AI RESPONSE GENERATION ───────────────────────────────────────────────────
+// ─── AI HELPERS ───────────────────────────────────────
 async function generateAIResponses(content, username, platform) {
-  const systemPrompt = `You are a senior brand engagement specialist for a peptide research brand.
-TONE: professional, helpful, knowledgeable
-PRODUCTS: research peptides (BPC-157, TB-500, CJC-1295, Ipamorelin, etc.)
+  if (!openai) return { error: 'OpenAI not configured' };
+
+  const settings = await getDb().then(d => d.get('SELECT * FROM brand_settings WHERE id = 1'));
+  const systemPrompt = `You are a senior brand engagement specialist for ${settings?.brand_name || 'our brand'}.
+TONE: ${settings?.tone || 'professional, helpful'}
+PRODUCTS: ${settings?.product_description || 'research peptides'}
+
 RULES:
-- Write 3 response variants (A, B, C)
-- Match the prospect's energy and context
+- Write 3 response variants (label A, B, C)
+- Match the prospect's energy and communication style
 - Lead with VALUE (helpful info, not sales pitch)
 - Keep each response under 280 characters
-- NEVER make medical claims or promises
-- Sound like a knowledgeable peer, not a marketer
-- Include a subtle CTA pointing to quality research peptides
-OUTPUT FORMAT: JSON with the following structure:
-{
-  "variants": [
-    { "label": "A", "text": "...", "strategy": "educational" },
-    { "label": "B", "text": "...", "strategy": "peer-to-peer" },
-    { "label": "C", "text": "...", "strategy": "value-first" }
-  ]
-}`;
+- NEVER make medical claims
+- NEVER include prices or promotional offers
+- Sound like a knowledgeable peer, not a brand rep
+- Include subtle brand mention only if natural
 
-  const userPrompt = `Platform: ${platform}
-Username: ${username}
-Post: "${content}"
+OUTPUT FORMAT: JSON with shape { "variants": [{ "label", "text", "strategy" }] }`;
 
-Generate 3 response variants that engage this prospect professionally.`;
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Platform: ${platform}\nUsername: ${username}\nPost: "${content}"\n\nGenerate 3 response variants.` }
+    ],
+    temperature: 0.7,
+    max_tokens: 500
+  });
 
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.7,
-      max_tokens: 500,
-    });
-
-    const result = JSON.parse(completion.choices[0].message.content);
-    return result;
-  } catch (error) {
-    console.error('[AI] Error generating responses:', error.message);
-    // Return fallback variants so the API doesn't break
-    return {
-      variants: [
-        { label: 'A', text: `Hey @${username}! Great question about peptides. Happy to share some research insights - DM me!`, strategy: 'fallback_engagement' },
-        { label: 'B', text: `That's a solid point on peptide research! Would love to exchange findings. Feel free to reach out!`, strategy: 'fallback_peer' },
-        { label: 'C', text: `Agreed - peptide quality varies a ton. We focus on lab-tested research-grade. Happy to help if you have questions!`, strategy: 'fallback_value' },
-      ],
-    };
-  }
+  return JSON.parse(completion.choices[0].message.content);
 }
 
-// ─── ACTIVITY LOGGING HELPER ──────────────────────────────────────────────────
-function logActivity(entityType, entityId, activityType, description) {
-  try {
-    const database = getDb();
-    database.prepare(`
-      INSERT INTO activities (id, entity_type, entity_id, activity_type, description, created_at)
-      VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, datetime('now'))
-    `).run(entityType, entityId, activityType, description);
-  } catch (err) {
-    console.error('[Activity] Failed to log activity:', err.message);
-  }
-}
+// ─── ROUTES ───────────────────────────────────────────
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  API ROUTES
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ─── Health Check ─────────────────────────────────────────────────────────────
+// Health
 app.get('/health', (req, res) => {
+  res.json({ status: 'ok', version: '2.1.0', service: 'peptideprospect-api', db: 'sqlite' });
+});
+
+// ─── Opportunities ────────────────────────────────────
+
+// LIST
+app.get('/api/opportunities', async (req, res) => {
   try {
-    const dbCheck = getDb().prepare('SELECT 1').get();
-    res.json({
-      status: 'ok',
-      version: VERSION,
-      uptime: Math.floor((Date.now() - startTime) / 1000),
-      db: 'sqlite',
-      db_connected: !!dbCheck,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    res.status(500).json({ status: 'error', message: error.message });
+    const d = await getDb();
+    const platform = req.query.platform || null;
+    const status = req.query.status || null;
+    const minScore = req.query.minScore ? parseInt(req.query.minScore) : null;
+    const limit = Math.min(req.query.limit ? parseInt(req.query.limit) : 50, 200);
+    const offset = req.query.offset ? parseInt(req.query.offset) : 0;
+    const q = req.query.q || null;
+
+    let sql = 'SELECT * FROM opportunities WHERE 1=1';
+    const params = [];
+
+    if (platform) { sql += ' AND platform = ?'; params.push(platform); }
+    if (status) { sql += ' AND status = ?'; params.push(status); }
+    if (minScore) { sql += ' AND intent_score >= ?'; params.push(minScore); }
+    if (q) { sql += ' AND (username LIKE ? OR content LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
+
+    const countResult = await d.get(`SELECT COUNT(*) as c FROM opportunities WHERE 1=1` +
+      (platform ? ' AND platform = ?' : '') +
+      (status ? ' AND status = ?' : '') +
+      (minScore ? ' AND intent_score >= ?' : '') +
+      (q ? ' AND (username LIKE ? OR content LIKE ?)' : ''),
+      [...(platform ? [platform] : []), ...(status ? [status] : []), ...(minScore ? [minScore] : []), ...(q ? [`%${q}%`, `%${q}%`] : [])]);
+
+    sql += ' ORDER BY intent_score DESC, discovered_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const rows = await d.all(sql, params);
+    res.json({ data: rows, total: countResult.c });
+  } catch (err) {
+    console.error('[Opportunities] Error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/opportunities ───────────────────────────────────────────────────
-// Query params: ?platform=&status=&minScore=&limit=&offset=&q=
-app.get('/api/opportunities', (req, res) => {
+// GET ONE
+app.get('/api/opportunities/:id', async (req, res) => {
   try {
-    const database = getDb();
-    const { platform, status, minScore, limit = '50', offset = '0', q } = req.query;
-
-    const conditions = [];
-    const params = {};
-
-    if (platform) {
-      conditions.push('platform = @platform');
-      params.platform = platform;
-    }
-    if (status) {
-      conditions.push('status = @status');
-      params.status = status;
-    }
-    if (minScore) {
-      conditions.push('intent_score >= @minScore');
-      params.minScore = parseInt(minScore, 10);
-    }
-    if (q) {
-      conditions.push('(username LIKE @q OR content LIKE @q)');
-      params.q = `%${q}%`;
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    // Count query
-    const countSql = `SELECT COUNT(*) as total FROM opportunities ${whereClause}`;
-    const countResult = database.prepare(countSql).get(params);
-
-    // Data query
-    const dataSql = `
-      SELECT * FROM opportunities
-      ${whereClause}
-      ORDER BY discovered_at DESC
-      LIMIT @limit OFFSET @offset
-    `;
-    params.limit = parseInt(limit, 10);
-    params.offset = parseInt(offset, 10);
-
-    const rows = database.prepare(dataSql).all(params);
-
-    // Parse JSON fields
-    const parsedRows = rows.map((row) => ({
-      ...row,
-      ai_responses: safeJsonParse(row.ai_responses, null),
-      keywords_matched: safeJsonParse(row.keywords_matched, []),
-      raw_data: safeJsonParse(row.raw_data, {}),
-    }));
-
-    res.json({
-      data: parsedRows,
-      total: countResult.total,
-      limit: params.limit,
-      offset: params.offset,
-    });
-  } catch (error) {
-    console.error('[API] GET /api/opportunities error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch opportunities', message: error.message });
+    const d = await getDb();
+    const row = await d.get('SELECT * FROM opportunities WHERE id = ?', [req.params.id]);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (row.ai_responses) try { row.ai_responses = JSON.parse(row.ai_responses); } catch(e) {}
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/opportunities/:id ───────────────────────────────────────────────
-app.get('/api/opportunities/:id', (req, res) => {
+// CREATE
+app.post('/api/opportunities', async (req, res) => {
   try {
-    const database = getDb();
-    const { id } = req.params;
-
-    const row = database.prepare('SELECT * FROM opportunities WHERE id = ?').get(id);
-
-    if (!row) {
-      return res.status(404).json({ error: 'Opportunity not found' });
-    }
-
-    // Parse JSON fields
-    const opportunity = {
-      ...row,
-      ai_responses: safeJsonParse(row.ai_responses, null),
-      keywords_matched: safeJsonParse(row.keywords_matched, []),
-      raw_data: safeJsonParse(row.raw_data, {}),
-    };
-
-    res.json(opportunity);
-  } catch (error) {
-    console.error('[API] GET /api/opportunities/:id error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch opportunity', message: error.message });
+    const d = await getDb();
+    const o = req.body;
+    await d.run(`INSERT INTO opportunities (id, platform, username, content, intent_type, intent_score, subreddit, post_url, media_url, status, keywords_matched, discovered_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      [o.id, o.platform, o.username, o.content, o.intent_type, o.intent_score, o.subreddit, o.post_url, o.media_url, o.status || 'new', JSON.stringify(o.keywords_matched || [])]);
+    const row = await d.get('SELECT * FROM opportunities WHERE id = ?', [o.id]);
+    res.status(201).json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/opportunities/:id/respond ──────────────────────────────────────
+// UPDATE
+app.patch('/api/opportunities/:id', async (req, res) => {
+  try {
+    const d = await getDb();
+    const fields = [];
+    const values = [];
+    for (const [k, v] of Object.entries(req.body)) {
+      if (['content','intent_type','intent_score','status','engaged','ai_responses','keywords_matched'].includes(k)) {
+        fields.push(`${k} = ?`);
+        values.push(v);
+      }
+    }
+    if (fields.length === 0) return res.status(400).json({ error: 'No valid fields' });
+    values.push(req.params.id);
+    await d.run(`UPDATE opportunities SET ${fields.join(', ')}, updated_at = datetime('now') WHERE id = ?`, values);
+    const row = await d.get('SELECT * FROM opportunities WHERE id = ?', [req.params.id]);
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── AI Response Generation ───────────────────────────
+
 app.post('/api/opportunities/:id/respond', async (req, res) => {
   try {
-    const database = getDb();
-    const { id } = req.params;
+    const d = await getDb();
+    const opp = await d.get('SELECT * FROM opportunities WHERE id = ?', [req.params.id]);
+    if (!opp) return res.status(404).json({ error: 'Opportunity not found' });
 
-    // Fetch the opportunity
-    const opportunity = database.prepare('SELECT * FROM opportunities WHERE id = ?').get(id);
-    if (!opportunity) {
-      return res.status(404).json({ error: 'Opportunity not found' });
-    }
+    const aiResult = await generateAIResponses(opp.content, opp.username, opp.platform);
+    if (aiResult.error) return res.status(503).json({ error: aiResult.error });
 
-    // Check if responses already exist
-    if (opportunity.ai_responses) {
-      const existing = safeJsonParse(opportunity.ai_responses, null);
-      if (existing && existing.variants && existing.variants.length > 0) {
-        return res.json({
-          message: 'Responses already generated',
-          opportunity_id: id,
-          variants: existing.variants,
-        });
-      }
-    }
+    // Save AI responses to opportunity
+    await d.run('UPDATE opportunities SET ai_responses = ? WHERE id = ?', [JSON.stringify(aiResult), opp.id]);
 
-    // Check if API key is available
-    if (!OPENAI_API_KEY) {
-      return res.status(503).json({
-        error: 'OpenAI API key not configured',
-        message: 'Please set the OPENAI_API_KEY environment variable',
-      });
-    }
-
-    // Generate AI responses
-    const aiResult = await generateAIResponses(
-      opportunity.content,
-      opportunity.username,
-      opportunity.platform
-    );
-
-    // Save responses to opportunity
-    const aiResponsesJson = JSON.stringify(aiResult);
-    database.prepare(`
-      UPDATE opportunities
-      SET ai_responses = ?, status = 'responded', updated_at = datetime('now'), engaged = 1
-      WHERE id = ?
-    `).run(aiResponsesJson, id);
-
-    // Create engagement queue entries for each variant
-    if (aiResult.variants && Array.isArray(aiResult.variants)) {
-      const insertQueue = database.prepare(`
-        INSERT INTO engagement_queue (id, opportunity_id, platform, response_text, post_url, recipient_username, status, created_at)
-        VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, 'pending', datetime('now'))
-      `);
-
-      for (const variant of aiResult.variants) {
-        insertQueue.run(
-          id,
-          opportunity.platform,
-          variant.text,
-          opportunity.post_url,
-          opportunity.username
-        );
-      }
+    // Create queue entry
+    for (const variant of aiResult.variants || []) {
+      await d.run(`INSERT INTO engagement_queue (opportunity_id, platform, response_text, post_url, status)
+        VALUES (?, ?, ?, ?, 'pending')`,
+        [opp.id, opp.platform, variant.text, opp.post_url]);
     }
 
     // Log activity
-    logActivity('opportunity', id, 'ai_responses_generated', `Generated ${aiResult.variants?.length || 0} AI response variants for ${opportunity.username}`);
+    await d.run(`INSERT INTO activities (entity_type, entity_id, activity_type, description)
+      VALUES (?, ?, 'ai_response', ?)`,
+      ['opportunity', opp.id, `Generated ${aiResult.variants?.length || 0} response variants`]);
 
-    res.json({
-      message: 'AI responses generated successfully',
-      opportunity_id: id,
-      variants: aiResult.variants || [],
-    });
-  } catch (error) {
-    console.error('[API] POST /api/opportunities/:id/respond error:', error.message);
-    res.status(500).json({ error: 'Failed to generate responses', message: error.message });
+    res.json(aiResult);
+  } catch (err) {
+    console.error('[Respond] Error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/queue ───────────────────────────────────────────────────────────
-app.get('/api/queue', (req, res) => {
+// ─── Queue / Approval ─────────────────────────────────
+
+app.get('/api/queue', async (req, res) => {
   try {
-    const database = getDb();
-    const { status, limit = '50', offset = '0' } = req.query;
+    const d = await getDb();
+    const status = req.query.status || null;
+    let sql = `SELECT q.*, o.username, o.content as opportunity_content, o.intent_score, o.subreddit, o.post_url as opp_post_url
+      FROM engagement_queue q LEFT JOIN opportunities o ON q.opportunity_id = o.id WHERE 1=1`;
+    const params = [];
+    if (status) { sql += ' AND q.status = ?'; params.push(status); }
+    sql += ' ORDER BY q.created_at DESC';
 
-    const conditions = [];
-    const params = {};
-
-    if (status) {
-      conditions.push('q.status = @status');
-      params.status = status;
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    // Count query
-    const countSql = `SELECT COUNT(*) as total FROM engagement_queue q ${whereClause}`;
-    const countResult = database.prepare(countSql).get(params);
-
-    // Data query with JOIN to opportunities
-    const dataSql = `
-      SELECT
-        q.*,
-        o.content as opportunity_content,
-        o.username as opportunity_username,
-        o.platform as opportunity_platform,
-        o.intent_score as opportunity_intent_score,
-        o.intent_type as opportunity_intent_type,
-        o.subreddit as opportunity_subreddit,
-        o.post_url as opportunity_post_url
-      FROM engagement_queue q
-      LEFT JOIN opportunities o ON q.opportunity_id = o.id
-      ${whereClause}
-      ORDER BY q.created_at DESC
-      LIMIT @limit OFFSET @offset
-    `;
-    params.limit = parseInt(limit, 10);
-    params.offset = parseInt(offset, 10);
-
-    const rows = database.prepare(dataSql).all(params);
-
-    res.json({
-      data: rows,
-      total: countResult.total,
-      limit: params.limit,
-      offset: params.offset,
-    });
-  } catch (error) {
-    console.error('[API] GET /api/queue error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch queue', message: error.message });
+    const rows = await d.all(sql, params);
+    const count = await d.get('SELECT COUNT(*) as c FROM engagement_queue');
+    res.json({ data: rows, total: count.c });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/queue/:id/approve ──────────────────────────────────────────────
-app.post('/api/queue/:id/approve', (req, res) => {
+app.post('/api/queue/:id/approve', async (req, res) => {
   try {
-    const database = getDb();
-    const { id } = req.params;
-
-    // Check if item exists
-    const item = database.prepare('SELECT * FROM engagement_queue WHERE id = ?').get(id);
-    if (!item) {
-      return res.status(404).json({ error: 'Queue item not found' });
-    }
-
-    // Update status to approved
-    database.prepare(`
-      UPDATE engagement_queue
-      SET status = 'approved', updated_at = datetime('now')
-      WHERE id = ?
-    `).run(id);
-
-    // Update opportunity status too
-    if (item.opportunity_id) {
-      database.prepare(`
-        UPDATE opportunities
-        SET status = 'approved', updated_at = datetime('now')
-        WHERE id = ?
-      `).run(item.opportunity_id);
-    }
-
-    logActivity('engagement_queue', id, 'approved', `Approved queue item for ${item.recipient_username}`);
-
-    res.json({ message: 'Queue item approved', id });
-  } catch (error) {
-    console.error('[API] POST /api/queue/:id/approve error:', error.message);
-    res.status(500).json({ error: 'Failed to approve queue item', message: error.message });
+    const d = await getDb();
+    await d.run("UPDATE engagement_queue SET status = 'approved' WHERE id = ?", [req.params.id]);
+    const row = await d.get('SELECT * FROM engagement_queue WHERE id = ?', [req.params.id]);
+    res.json({ success: true, item: row });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/queue/:id/reject ───────────────────────────────────────────────
-app.post('/api/queue/:id/reject', (req, res) => {
+app.post('/api/queue/:id/reject', async (req, res) => {
   try {
-    const database = getDb();
-    const { id } = req.params;
-    const { reason = 'No reason provided' } = req.body;
-
-    // Check if item exists
-    const item = database.prepare('SELECT * FROM engagement_queue WHERE id = ?').get(id);
-    if (!item) {
-      return res.status(404).json({ error: 'Queue item not found' });
-    }
-
-    // Update status to rejected
-    database.prepare(`
-      UPDATE engagement_queue
-      SET status = 'rejected', error_message = ?, updated_at = datetime('now')
-      WHERE id = ?
-    `).run(reason, id);
-
-    logActivity('engagement_queue', id, 'rejected', `Rejected queue item for ${item.recipient_username}: ${reason}`);
-
-    res.json({ message: 'Queue item rejected', id, reason });
-  } catch (error) {
-    console.error('[API] POST /api/queue/:id/reject error:', error.message);
-    res.status(500).json({ error: 'Failed to reject queue item', message: error.message });
+    const d = await getDb();
+    await d.run("UPDATE engagement_queue SET status = 'rejected', error_message = ? WHERE id = ?",
+      [req.body.reason || 'Rejected by user', req.params.id]);
+    const row = await d.get('SELECT * FROM engagement_queue WHERE id = ?', [req.params.id]);
+    res.json({ success: true, item: row });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/analytics ───────────────────────────────────────────────────────
-app.get('/api/analytics', (req, res) => {
+// ─── Bulk Operations ──────────────────────────────────
+
+app.post('/api/bulk/approve', async (req, res) => {
   try {
-    const database = getDb();
+    const d = await getDb();
+    const ids = req.body.ids || [];
+    for (const id of ids) {
+      await d.run("UPDATE engagement_queue SET status = 'approved' WHERE id = ?", [id]);
+    }
+    res.json({ success: true, updated: ids.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    // Total opportunities
-    const totalOpportunities = database.prepare('SELECT COUNT(*) as count FROM opportunities').get();
+app.post('/api/bulk/reject', async (req, res) => {
+  try {
+    const d = await getDb();
+    const ids = req.body.ids || [];
+    const reason = req.body.reason || 'Bulk rejected';
+    for (const id of ids) {
+      await d.run("UPDATE engagement_queue SET status = 'rejected', error_message = ? WHERE id = ?", [reason, id]);
+    }
+    res.json({ success: true, updated: ids.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    // Average intent score
-    const avgIntentScore = database.prepare('SELECT COALESCE(AVG(intent_score), 0) as avg FROM opportunities').get();
+// ─── Analytics ────────────────────────────────────────
 
-    // Engagement rate (engaged / total)
-    const engagedCount = database.prepare('SELECT COUNT(*) as count FROM opportunities WHERE engaged = 1').get();
-    const totalCount = totalOpportunities.count || 1;
-    const engagementRate = Math.round((engagedCount.count / totalCount) * 100);
+app.get('/api/analytics', async (req, res) => {
+  try {
+    const d = await getDb();
+    const total = await d.get('SELECT COUNT(*) as c FROM opportunities');
+    const avgScore = await d.get('SELECT AVG(intent_score) as avg FROM opportunities');
+    const engaged = await d.get('SELECT COUNT(*) as c FROM opportunities WHERE engaged = 1');
+    const engagementRate = total.c > 0 ? ((engaged.c / total.c) * 100).toFixed(1) : 0;
 
-    // Platform breakdown
-    const platformBreakdown = database.prepare(`
-      SELECT platform, COUNT(*) as count FROM opportunities GROUP BY platform ORDER BY count DESC
-    `).all();
+    const platformBreakdown = await d.all('SELECT platform, COUNT(*) as count FROM opportunities GROUP BY platform');
 
-    // Daily discovery (last 7 days)
-    const dailyDiscovery = database.prepare(`
-      SELECT date(discovered_at) as date, COUNT(*) as count
-      FROM opportunities
-      GROUP BY date(discovered_at)
-      ORDER BY date DESC
-      LIMIT 7
-    `).all();
+    const dailyDiscovery = await d.all(`SELECT date(discovered_at) as date, COUNT(*) as count FROM opportunities
+      GROUP BY date ORDER BY date DESC LIMIT 7`);
 
-    // Score distribution
-    const ranges = [
-      { range: '90-100', min: 90, max: 100 },
-      { range: '80-89', min: 80, max: 89 },
-      { range: '70-79', min: 70, max: 79 },
-      { range: '60-69', min: 60, max: 69 },
-      { range: '0-59', min: 0, max: 59 },
+    const scoreDistribution = [
+      { range: '90-100', count: (await d.get('SELECT COUNT(*) as c FROM opportunities WHERE intent_score >= 90')).c },
+      { range: '80-89', count: (await d.get('SELECT COUNT(*) as c FROM opportunities WHERE intent_score >= 80 AND intent_score < 90')).c },
+      { range: '70-79', count: (await d.get('SELECT COUNT(*) as c FROM opportunities WHERE intent_score >= 70 AND intent_score < 80')).c },
+      { range: '60-69', count: (await d.get('SELECT COUNT(*) as c FROM opportunities WHERE intent_score >= 60 AND intent_score < 70')).c },
+      { range: '<60', count: (await d.get('SELECT COUNT(*) as c FROM opportunities WHERE intent_score < 60')).c },
     ];
 
-    const scoreDistribution = ranges.map((r) => {
-      const result = database.prepare(`
-        SELECT COUNT(*) as count FROM opportunities WHERE intent_score >= ? AND intent_score <= ?
-      `).get(r.min, r.max);
-      return { range: r.range, count: result.count };
-    });
-
-    // Intent type breakdown
-    const intentTypeBreakdown = database.prepare(`
-      SELECT intent_type, COUNT(*) as count FROM opportunities WHERE intent_type IS NOT NULL GROUP BY intent_type
-    `).all();
-
-    // Subreddit breakdown (Reddit only)
-    const subredditBreakdown = database.prepare(`
-      SELECT subreddit, COUNT(*) as count FROM opportunities WHERE platform = 'reddit' AND subreddit IS NOT NULL GROUP BY subreddit ORDER BY count DESC
-    `).all();
-
-    // Queue status breakdown
-    const queueBreakdown = database.prepare(`
-      SELECT status, COUNT(*) as count FROM engagement_queue GROUP BY status
-    `).all();
-
-    // Recent activity
-    const recentActivity = database.prepare(`
-      SELECT * FROM activities ORDER BY created_at DESC LIMIT 20
-    `).all();
-
     res.json({
-      totalOpportunities: totalOpportunities.count || 0,
-      avgIntentScore: Math.round(avgIntentScore.avg || 0),
-      engagementRate,
+      totalOpportunities: total.c,
+      avgIntentScore: Math.round(avgScore.avg || 0),
+      engagementRate: parseFloat(engagementRate),
       platformBreakdown,
       dailyDiscovery,
-      scoreDistribution,
-      intentTypeBreakdown,
-      subredditBreakdown,
-      queueBreakdown,
-      recentActivity,
+      scoreDistribution
     });
-  } catch (error) {
-    console.error('[API] GET /api/analytics error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch analytics', message: error.message });
+  } catch (err) {
+    console.error('[Analytics] Error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/settings ────────────────────────────────────────────────────────
-app.get('/api/settings', (req, res) => {
-  try {
-    const database = getDb();
-    const settings = database.prepare('SELECT * FROM brand_settings WHERE id = 1').get();
+// ─── Settings ─────────────────────────────────────────
 
-    if (!settings) {
-      return res.status(404).json({ error: 'Settings not found' });
+app.get('/api/settings', async (req, res) => {
+  try {
+    const d = await getDb();
+    const row = await d.get('SELECT * FROM brand_settings WHERE id = 1');
+    if (row) {
+      try { row.keywords = JSON.parse(row.keywords); } catch(e) {}
+      try { row.platforms_enabled = JSON.parse(row.platforms_enabled); } catch(e) {}
     }
-
-    // Parse JSON fields
-    const parsedSettings = {
-      ...settings,
-      keywords: safeJsonParse(settings.keywords, []),
-      platforms_enabled: safeJsonParse(settings.platforms_enabled, []),
-    };
-
-    res.json(parsedSettings);
-  } catch (error) {
-    console.error('[API] GET /api/settings error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch settings', message: error.message });
+    res.json(row || {});
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── PATCH /api/settings ──────────────────────────────────────────────────────
-app.patch('/api/settings', (req, res) => {
+app.patch('/api/settings', async (req, res) => {
   try {
-    const database = getDb();
-    const updates = req.body;
-
-    // Build dynamic update
-    const allowedFields = ['brand_name', 'tone', 'product_description', 'keywords', 'platforms_enabled', 'auto_engage_threshold'];
-    const setClauses = [];
+    const d = await getDb();
+    const fields = [];
     const values = [];
-
-    for (const field of allowedFields) {
-      if (updates[field] !== undefined) {
-        // If it's an array field, stringify it
-        if ((field === 'keywords' || field === 'platforms_enabled') && Array.isArray(updates[field])) {
-          setClauses.push(`${field} = ?`);
-          values.push(JSON.stringify(updates[field]));
-        } else {
-          setClauses.push(`${field} = ?`);
-          values.push(updates[field]);
-        }
+    for (const [k, v] of Object.entries(req.body)) {
+      if (['brand_name','tone','product_description','keywords','platforms_enabled','auto_engage_threshold'].includes(k)) {
+        fields.push(`${k} = ?`);
+        values.push(typeof v === 'object' ? JSON.stringify(v) : v);
       }
     }
-
-    if (setClauses.length === 0) {
-      return res.status(400).json({ error: 'No valid fields to update' });
-    }
-
-    const sql = `UPDATE brand_settings SET ${setClauses.join(', ')} WHERE id = 1`;
-    database.prepare(sql).run(...values);
-
-    // Fetch updated settings
-    const updated = database.prepare('SELECT * FROM brand_settings WHERE id = 1').get();
-    const parsedUpdated = {
-      ...updated,
-      keywords: safeJsonParse(updated.keywords, []),
-      platforms_enabled: safeJsonParse(updated.platforms_enabled, []),
-    };
-
-    logActivity('settings', '1', 'settings_updated', `Brand settings updated`);
-
-    res.json({ message: 'Settings updated', settings: parsedUpdated });
-  } catch (error) {
-    console.error('[API] PATCH /api/settings error:', error.message);
-    res.status(500).json({ error: 'Failed to update settings', message: error.message });
+    if (fields.length === 0) return res.status(400).json({ error: 'No valid fields' });
+    values.push(1); // WHERE id = 1
+    await d.run(`UPDATE brand_settings SET ${fields.join(', ')} WHERE id = ?`, values);
+    const row = await d.get('SELECT * FROM brand_settings WHERE id = 1');
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/bulk/approve ───────────────────────────────────────────────────
-app.post('/api/bulk/approve', (req, res) => {
+// ─── Activities ───────────────────────────────────────
+
+app.get('/api/activities', async (req, res) => {
   try {
-    const database = getDb();
-    const { ids } = req.body;
-
-    if (!Array.isArray(ids) || ids.length === 0) {
-      return res.status(400).json({ error: 'ids array required' });
-    }
-
-    // Use transaction for bulk update
-    const update = database.prepare('UPDATE engagement_queue SET status = \'approved\', updated_at = datetime(\'now\') WHERE id = ?');
-    const updateOpp = database.prepare('UPDATE opportunities SET status = \'approved\', updated_at = datetime(\'now\') WHERE id = (SELECT opportunity_id FROM engagement_queue WHERE id = ?)');
-
-    let updatedCount = 0;
-    const updateMany = database.transaction((itemIds) => {
-      for (const id of itemIds) {
-        const result = update.run(id);
-        if (result.changes > 0) {
-          updatedCount++;
-          try { updateOpp.run(id); } catch (e) { /* ignore opp update errors */ }
-        }
-      }
-    });
-
-    updateMany(ids);
-
-    logActivity('engagement_queue', 'bulk', 'bulk_approved', `Bulk approved ${updatedCount} queue items`);
-
-    res.json({ message: `Approved ${updatedCount} queue items`, updated: updatedCount });
-  } catch (error) {
-    console.error('[API] POST /api/bulk/approve error:', error.message);
-    res.status(500).json({ error: 'Failed to bulk approve', message: error.message });
+    const d = await getDb();
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const rows = await d.all('SELECT * FROM activities ORDER BY created_at DESC LIMIT ?', [limit]);
+    res.json({ data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/bulk/reject ────────────────────────────────────────────────────
-app.post('/api/bulk/reject', (req, res) => {
-  try {
-    const database = getDb();
-    const { ids, reason = 'Bulk rejection' } = req.body;
+// ─── Error Handler ────────────────────────────────────
 
-    if (!Array.isArray(ids) || ids.length === 0) {
-      return res.status(400).json({ error: 'ids array required' });
-    }
-
-    const update = database.prepare('UPDATE engagement_queue SET status = \'rejected\', error_message = ?, updated_at = datetime(\'now\') WHERE id = ?');
-
-    let updatedCount = 0;
-    const updateMany = database.transaction((itemIds) => {
-      for (const id of itemIds) {
-        const result = update.run(reason, id);
-        if (result.changes > 0) {
-          updatedCount++;
-        }
-      }
-    });
-
-    updateMany(ids);
-
-    logActivity('engagement_queue', 'bulk', 'bulk_rejected', `Bulk rejected ${updatedCount} queue items: ${reason}`);
-
-    res.json({ message: `Rejected ${updatedCount} queue items`, updated: updatedCount, reason });
-  } catch (error) {
-    console.error('[API] POST /api/bulk/reject error:', error.message);
-    res.status(500).json({ error: 'Failed to bulk reject', message: error.message });
-  }
+app.use((err, req, res, next) => {
+  console.error('[Error]', err);
+  res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  EXTRA UTILITY ENDPOINTS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── START ────────────────────────────────────────────
+async function start() {
+  await initDb();
+  await seedData();
 
-// ─── GET /api/activities ──────────────────────────────────────────────────────
-app.get('/api/activities', (req, res) => {
-  try {
-    const database = getDb();
-    const { limit = '20', offset = '0' } = req.query;
-
-    const total = database.prepare('SELECT COUNT(*) as total FROM activities').get();
-    const rows = database.prepare(`
-      SELECT * FROM activities ORDER BY created_at DESC LIMIT ? OFFSET ?
-    `).all(parseInt(limit, 10), parseInt(offset, 10));
-
-    res.json({
-      data: rows,
-      total: total.total,
-      limit: parseInt(limit, 10),
-      offset: parseInt(offset, 10),
-    });
-  } catch (error) {
-    console.error('[API] GET /api/activities error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch activities', message: error.message });
-  }
-});
-
-// ─── POST /api/opportunities/:id/engage ───────────────────────────────────────
-app.post('/api/opportunities/:id/engage', (req, res) => {
-  try {
-    const database = getDb();
-    const { id } = req.params;
-    const { responseText } = req.body;
-
-    // Check if opportunity exists
-    const opp = database.prepare('SELECT * FROM opportunities WHERE id = ?').get(id);
-    if (!opp) {
-      return res.status(404).json({ error: 'Opportunity not found' });
-    }
-
-    // Create queue entry with the provided response text
-    const insertQueue = database.prepare(`
-      INSERT INTO engagement_queue (id, opportunity_id, platform, response_text, post_url, recipient_username, status, created_at)
-      VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, 'pending', datetime('now'))
-    `);
-
-    const response = responseText || (opp.ai_responses ? safeJsonParse(opp.ai_responses, null)?.variants?.[0]?.text : null);
-
-    if (!response) {
-      return res.status(400).json({ error: 'No response text available. Generate AI responses first or provide responseText in body.' });
-    }
-
-    insertQueue.run(id, opp.platform, response, opp.post_url, opp.username);
-
-    // Update opportunity status
-    database.prepare(`
-      UPDATE opportunities SET status = 'queued', updated_at = datetime('now') WHERE id = ?
-    `).run(id);
-
-    logActivity('opportunity', id, 'queued', `Manually queued engagement for ${opp.username}`);
-
-    res.json({ message: 'Opportunity queued for engagement', opportunity_id: id, response });
-  } catch (error) {
-    console.error('[API] POST /api/opportunities/:id/engage error:', error.message);
-    res.status(500).json({ error: 'Failed to queue engagement', message: error.message });
-  }
-});
-
-// ─── GET /api/platforms ───────────────────────────────────────────────────────
-app.get('/api/platforms', (req, res) => {
-  try {
-    const database = getDb();
-    const platforms = database.prepare(`
-      SELECT platform, COUNT(*) as opportunity_count,
-             AVG(intent_score) as avg_intent_score
-      FROM opportunities
-      GROUP BY platform
-      ORDER BY opportunity_count DESC
-    `).all();
-
-    res.json({ data: platforms });
-  } catch (error) {
-    console.error('[API] GET /api/platforms error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch platforms', message: error.message });
-  }
-});
-
-// ─── POST /api/opportunities (manual creation) ────────────────────────────────
-app.post('/api/opportunities', (req, res) => {
-  try {
-    const database = getDb();
-    const {
-      id,
-      platform,
-      username,
-      content,
-      intent_type,
-      intent_score,
-      subreddit,
-      post_url,
-      media_url,
-      keywords_matched,
-      raw_data,
-    } = req.body;
-
-    if (!platform || !username || !content) {
-      return res.status(400).json({ error: 'platform, username, and content are required' });
-    }
-
-    const oppId = id || `opp_${platform}_${Date.now()}`;
-
-    database.prepare(`
-      INSERT INTO opportunities (id, platform, username, content, intent_type, intent_score, subreddit, post_url, media_url, keywords_matched, raw_data, discovered_at, updated_at, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), 'new')
-    `).run(
-      oppId,
-      platform,
-      username,
-      content,
-      intent_type || null,
-      intent_score || 0,
-      subreddit || null,
-      post_url || null,
-      media_url || null,
-      Array.isArray(keywords_matched) ? JSON.stringify(keywords_matched) : keywords_matched || null,
-      typeof raw_data === 'object' ? JSON.stringify(raw_data) : raw_data || null
-    );
-
-    logActivity('opportunity', oppId, 'manual_created', `Manually created opportunity from ${platform} by ${username}`);
-
-    res.status(201).json({ message: 'Opportunity created', id: oppId });
-  } catch (error) {
-    console.error('[API] POST /api/opportunities error:', error.message);
-    res.status(500).json({ error: 'Failed to create opportunity', message: error.message });
-  }
-});
-
-// ─── DELETE /api/opportunities/:id ────────────────────────────────────────────
-app.delete('/api/opportunities/:id', (req, res) => {
-  try {
-    const database = getDb();
-    const { id } = req.params;
-
-    // Check if opportunity exists
-    const opp = database.prepare('SELECT * FROM opportunities WHERE id = ?').get(id);
-    if (!opp) {
-      return res.status(404).json({ error: 'Opportunity not found' });
-    }
-
-    // Delete related queue items first (foreign key handles this, but let's be explicit)
-    database.prepare('DELETE FROM engagement_queue WHERE opportunity_id = ?').run(id);
-
-    // Delete the opportunity
-    database.prepare('DELETE FROM opportunities WHERE id = ?').run(id);
-
-    logActivity('opportunity', id, 'deleted', `Deleted opportunity ${id} and related queue items`);
-
-    res.json({ message: 'Opportunity deleted', id });
-  } catch (error) {
-    console.error('[API] DELETE /api/opportunities/:id error:', error.message);
-    res.status(500).json({ error: 'Failed to delete opportunity', message: error.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  ERROR HANDLING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', path: req.path, method: req.method });
-});
-
-// Global error handler
-app.use((err, req, res, _next) => {
-  console.error('[Server] Unhandled error:', err.message);
-  console.error(err.stack);
-  res.status(500).json({ error: 'Internal server error', message: err.message });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  HELPER FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function safeJsonParse(str, fallback) {
-  if (!str) return fallback;
-  try {
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
+  app.listen(PORT, () => {
+    console.log(`[API] PeptideProspect backend on port ${PORT}`);
+    console.log(`[API] SQLite: ${DB_PATH}`);
+    console.log(`[API] OpenAI: ${openai ? 'configured' : 'NOT configured'}`);
+  });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SERVER STARTUP
-// ═══════════════════════════════════════════════════════════════════════════════
-
-initDb();
-seedData();
-
-app.listen(PORT, () => {
-  console.log(`═══════════════════════════════════════════`);
-  console.log(`  PeptideProspect AI - SQLite Backend v${VERSION}`);
-  console.log(`  Listening on port ${PORT}`);
-  console.log(`  Database: ${DB_PATH}`);
-  console.log(`  OpenAI API: ${OPENAI_API_KEY ? 'Configured ✓' : 'NOT CONFIGURED ✗'}`);
-  console.log(`═══════════════════════════════════════════`);
+start().catch(err => {
+  console.error('[Fatal] Could not start:', err);
+  process.exit(1);
 });
-
-module.exports = app;
