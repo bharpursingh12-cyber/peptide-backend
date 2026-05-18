@@ -1,0 +1,30 @@
+{
+  "name": "peptideprospect-backend",
+  "version": "2.1.0",
+  "description": "PeptideProspect AI - SQLite Backend for peptide social media engagement",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo 'No tests configured'"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "openai": "^4.28.0",
+    "better-sqlite3": "^9.4.0"
+  },
+  "keywords": [
+    "peptide",
+    "social-media",
+    "engagement",
+    "sqlite",
+    "openai",
+    "api"
+  ],
+  "author": "PeptideProspect AI",
+  "license": "MIT"
+}
